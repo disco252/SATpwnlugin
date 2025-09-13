@@ -157,8 +157,12 @@ class SATpwn(plugins.Plugin):
         logging.info("[SATpwn] plugin ready")
     
     def on_ui_setup(self, ui):
-        ui.add_element('sat_mode', components.Text(color=view.WHITE, value=f'SAT Mode: {self.mode.capitalize()}',
-                                                  position=(5, 5)))
+        logging.info("[SATpwn] on_ui_setup() called")
+        ui.add_element('sat_mode', components.Text(
+        color=view.WHITE,
+        value=f'SAT Mode: {self.mode.capitalize()}',
+        position=(5,5)))
+        logging.info("[SATpwn] UI element added")
     
     def on_ui_update(self, ui):
         ui.set('sat_mode', f'SAT Mode: {self.mode.capitalize()}')
