@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 class SATpwn(plugins.Plugin):
     __author__ = 'Renmeii x Mr-Cass-Ette and disco too '
-    __version__ = 'x88.0.2'
+    __version__ = 'x88.0.3'
     __license__ = 'GPL3'
     __description__ = 'SATpwn, the superior way to capture handshakes '
     
@@ -41,30 +41,68 @@ class SATpwn(plugins.Plugin):
         self.modes = ['strict', 'loose', 'drive-by', 'recon']
         self.memory_path = '/etc/pwnagotchi/SATpwn_memory.json'
         self.executor = ThreadPoolExecutor(max_workers=5)
-        self.mode = self.modes[0]
+        self.mode = self.modes[0]  # Default mode, will be overridden by _load_memory()
         self.channel_stats = {}
         self.memory_is_dirty = True
         self.recon_channel_iterator = None
         self.recon_channels_tested = []
         
     def _save_memory(self):
-        """Saves the current AP/client memory to a JSON file."""
+        """Saves the current AP/client memory and current mode to a JSON file."""
         try:
+            # Create a complete memory structure that includes metadata
+            memory_data = {
+                "plugin_metadata": {
+                    "current_mode": self.mode,
+                    "last_saved": time.time(),
+                    "version": self.__version__
+                },
+                "ap_data": self.memory
+            }
+            
             with open(self.memory_path, 'w') as f:
-                json.dump(self.memory, f, indent=4)
-            logging.info(f"[SATpwn] Memory saved to {self.memory_path}")
+                json.dump(memory_data, f, indent=4)
+            logging.info(f"[SATpwn] Memory and mode '{self.mode}' saved to {self.memory_path}")
         except Exception as e:
             logging.error(f"[SATpwn] Error saving memory: {e}")
     
     def _load_memory(self):
-        """Loads the AP/client memory from a JSON file."""
+        """Loads the AP/client memory and restores the last saved mode from a JSON file."""
         if os.path.exists(self.memory_path):
             try:
                 with open(self.memory_path, 'r') as f:
-                    self.memory = json.load(f)
-                logging.info(f"[SATpwn] Memory loaded from {self.memory_path}")
+                    data = json.load(f)
+                
+                # Handle both old format (direct AP data) and new format (with metadata)
+                if "plugin_metadata" in data:
+                    # New format with metadata
+                    metadata = data["plugin_metadata"]
+                    self.memory = data.get("ap_data", {})
+                    
+                    # Restore the last saved mode
+                    saved_mode = metadata.get("current_mode", self.modes[0])
+                    if saved_mode in self.modes:
+                        self.mode = saved_mode
+                        logging.info(f"[SATpwn] Restored mode: {self.mode}")
+                    else:
+                        logging.warning(f"[SATpwn] Invalid saved mode '{saved_mode}', using default: {self.modes[0]}")
+                        self.mode = self.modes[0]
+                    
+                    last_saved = metadata.get("last_saved", 0)
+                    time_diff = time.time() - last_saved
+                    logging.info(f"[SATpwn] Memory loaded from {self.memory_path} (last saved {time_diff:.0f}s ago)")
+                else:
+                    # Old format - just AP data
+                    self.memory = data
+                    self.mode = self.modes[0]  # Default to strict mode
+                    logging.info(f"[SATpwn] Legacy memory format loaded, defaulting to mode: {self.mode}")
+                    
             except Exception as e:
                 logging.error(f"[SATpwn] Error loading memory: {e}")
+                self.memory = {}
+                self.mode = self.modes[0]
+        else:
+            logging.info("[SATpwn] No existing memory file found, starting fresh")
     
     def _cleanup_memory(self):
         """Removes old APs and clients from memory to keep it relevant."""
@@ -144,24 +182,23 @@ class SATpwn(plugins.Plugin):
     
     def on_loaded(self):
         logging.info("[SATpwn] plugin loaded")
-        self._load_memory()
+        self._load_memory()  # This now also restores the saved mode
     
     def on_unload(self, ui):
-        self._save_memory()
+        self._save_memory()  # This now also saves the current mode
         self.executor.shutdown(wait=False)
         logging.info("[SATpwn] plugin unloaded")
     
     def on_ready(self, agent):
         self.agent = agent
         self.ready = True
-        logging.info("[SATpwn] plugin ready")
+        logging.info(f"[SATpwn] plugin ready in mode: {self.mode}")
     
     def on_ui_setup(self, ui):
         ui.add_element('sat_mode', components.Text(
         color=view.WHITE,
         value=f'SAT Mode: {self.mode.capitalize()}',
         position=(5,13)))
-
     
     def on_ui_update(self, ui):
         ui.set('sat_mode', f'SAT Mode: {self.mode.capitalize()}')
@@ -369,6 +406,9 @@ class SATpwn(plugins.Plugin):
         if not self.ready:
             return
         
+        # Save memory and current mode every epoch
+        self._save_memory()
+        
         supported_channels = agent.supported_channels()
         logging.debug(f"[SATpwn] Supported channels: {supported_channels}")
         
@@ -399,6 +439,8 @@ class SATpwn(plugins.Plugin):
             logging.debug(f"current index = {current_index}")
             next_index = (current_index + 1) % len(self.modes)
             logging.debug(f"next index = {next_index}")
+            
+            old_mode = self.mode
             self.mode = self.modes[next_index]
             
             # Reset recon state when switching modes
@@ -406,7 +448,10 @@ class SATpwn(plugins.Plugin):
                 self.recon_channel_iterator = None
                 self.recon_channels_tested = []
             
-            logging.info(f"[SATpwn] Mode changed to {self.mode}")
+            # Save the new mode immediately
+            self._save_memory()
+            
+            logging.info(f"[SATpwn] Mode changed from {old_mode} to {self.mode}")
             return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
         
         # Main dashboard page
