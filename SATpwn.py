@@ -404,7 +404,7 @@ class SATpwn(plugins.Plugin):
     def on_epoch(self, agent, epoch, epoch_data):
         self._cleanup_memory()
         if not self.ready:
-            return
+            return Response("Plugin not ready yet.", mimetype='text/html') #moved this from webhook added here, so always ready 
         
         # Save memory and current mode every epoch
         self._save_memory()
@@ -430,8 +430,8 @@ class SATpwn(plugins.Plugin):
             self._epoch_strict(agent, epoch, epoch_data, supported_channels)
     
     def on_webhook(self, path, request):
-        if not self.ready:
-            return Response("Plugin not ready yet.", mimetype='text/html')
+       # if not self.ready:
+         #   return Response("Plugin not ready yet.", mimetype='text/html')
         
         # Handle mode toggling
         if path == 'toggle_mode':
