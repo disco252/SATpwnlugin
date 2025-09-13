@@ -158,7 +158,7 @@ class SATpwn(plugins.Plugin):
     
     def on_ui_setup(self, ui):
         ui.add_element('sat_mode', components.Text(color=view.WHITE, value=f'SAT Mode: {self.mode.capitalize()}',
-                                                  position=(55, 120)))
+                                                  position=(5, 5)))
     
     def on_ui_update(self, ui):
         ui.set('sat_mode', f'SAT Mode: {self.mode.capitalize()}')
