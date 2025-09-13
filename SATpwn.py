@@ -10,7 +10,7 @@ import ast
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-class SmartAutoTune(plugins.Plugin):
+class SATpwn(plugins.Plugin):
     __author__ = 'Renmeii x Mr-Cass-Ette and disco too '
     __version__ = 'x88.0.2'
     __license__ = 'GPL3'
