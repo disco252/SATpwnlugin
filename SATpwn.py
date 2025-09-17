@@ -901,7 +901,7 @@ class SATpwn(plugins.Plugin):
                 </style>
             </head>
             <body>
-                <h1>SATpwn Dashboard (GPSD)</h1>
+                <h1>SATpwn Dashboard</h1>
                 <div class="container">
                     <div class="grid-2-col">
                         <div class="card">
