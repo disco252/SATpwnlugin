@@ -20,9 +20,9 @@ except ImportError:
 
 class SATpwn(plugins.Plugin):
     __author__ = 'Renmeii x Mr-Cass-Ette and discoJack too '
-    __version__ = 'x88.0.7'
+    __version__ = 'x88.0.7-no-gps'
     __license__ = 'GPL3'
-    __description__ = 'SATpwn intelligent targeting without GPS dependencies'
+    __description__ = 'SATpwn intelligent targeting system without GPS dependencies'
     
     # --- Constants for configuration ---
     AP_EXPIRY_SECONDS = 3600 * 48  # 48 hours
@@ -42,7 +42,7 @@ class SATpwn(plugins.Plugin):
     DRIVE_BY_ATTACK_SCORE_THRESHOLD = 20 # Lower score threshold
     DRIVE_BY_ATTACK_COOLDOWN_SECONDS = 60  # 1 minute
     
-    # AUTO Mode constants (time-based since no GPS)
+    # AUTO Mode constants (activity-based since no GPS)
     STATIONARY_SECONDS = 3600      # 1 hour to trigger "recon" mode
     ACTIVITY_THRESHOLD = 5         # Number of new APs to consider "moving"
     ACTIVITY_WINDOW_SECONDS = 300  # 5 minutes window for activity detection
@@ -60,7 +60,7 @@ class SATpwn(plugins.Plugin):
         self.recon_channel_iterator = None
         self.recon_channels_tested = []
         
-        # AUTO mode state (time-based without GPS)
+        # AUTO mode state (activity-based without GPS)
         self._last_activity_check = 0
         self._activity_history = []  # Track AP discoveries over time
         self.home_whitelist = set()
@@ -315,165 +315,475 @@ class SATpwn(plugins.Plugin):
                 del self.memory[ap_mac]
         
         for ap_mac in list(self.memory.keys()):
-            if ap_mac not in self.memory:
+            if ap_mac not in self.memory: 
                 continue
-                
-            ap = self.memory[ap_mac]
-            expired_clients = [client_mac for client_mac, client_data in ap.get("clients", {}).items()
-                              if now - client_data.get("last_seen", 0) > client_expiry]
+            clients = self.memory[ap_mac].get("clients", {})
+            expired_clients = [client_mac for client_mac, data in clients.items()
+                               if now - data.get("last_seen", 0) > client_expiry]
             for client_mac in expired_clients:
-                if client_mac in ap["clients"]:
-                    del ap["clients"][client_mac]
-                    logging.debug(f"[SATpwn] Removed expired client {client_mac} from AP {ap_mac}")
+                if client_mac in clients:
+                    del clients[client_mac]
+    
+    def _recalculate_client_score(self, ap_mac, client_mac):
+        """Calculates a client's score based on signal, success, and age."""
+        client_data = self.memory[ap_mac]['clients'][client_mac]
+        # Base score from signal strength
+        score = (client_data.get('signal', -100) + 100)
         
-        if expired_aps:
-            logging.info(f"[SATpwn] Cleaned up {len(expired_aps)} expired APs from memory")
+        # Bonus for recent handshake success
+        if client_data.get('last_success', 0) > time.time() - self.SUCCESS_BONUS_DURATION_SECONDS:
+            score += 50
+        
+        # Decay score based on how long ago the client was last seen
+        age_hours = (time.time() - client_data.get('last_seen', time.time())) / 3600
+        decay_amount = age_hours * self.SCORE_DECAY_PENALTY_PER_HOUR
+        score -= decay_amount
+        
+        # Ensure score doesn't go below zero
+        score = max(0, score)
+        
+        client_data['score'] = score
+        return score
+    
+    def _execute_attack(self, agent, ap_mac, client_mac):
+        """Logs the intent to attack a high-value target."""
+        # Block attacks if we're in AUTO mode and the logic says we should be passive
+        if self.mode == 'auto':
+            sub_mode = self._auto_mode_logic()
+            if sub_mode == 'recon':
+                logging.debug(f"[SATpwn] AUTO mode blocking attack - in recon/passive mode")
+                return
+                
+        try:
+            logging.info(f"[SATpwn] Executing tactical attack on {client_mac} via {ap_mac}")
+        except Exception as e:
+            logging.error(f"[SATpwn] Attack execution failed: {e}")
+    
+    def _get_channel_stats(self):
+        """Aggregates stats per channel from memory."""
+        channel_stats = {}
+        for ap_mac, ap_data in self.memory.items():
+            ch = ap_data.get("channel")
+            if ch is None: 
+                continue
+            if ch not in channel_stats:
+                channel_stats[ch] = {'aps': 0, 'clients': 0, 'handshakes': 0}
+            channel_stats[ch]['aps'] += 1
+            channel_stats[ch]['clients'] += len(ap_data.get('clients', {}))
+            channel_stats[ch]['handshakes'] += ap_data.get('handshakes', 0)
+        return channel_stats
+    
+    def _channel_iterator(self, channels):
+        """Generator that yields channels one by one and cycles through them."""
+        if not channels:
+            return
+        while True:
+            for channel in channels:
+                yield channel
     
     def on_loaded(self):
-        """Called when the plugin is loaded."""
-        self._load_memory()
-        logging.info(f"[SATpwn] Plugin loaded successfully. Current mode: {self.mode}")
-    
-    def on_ready(self, agent):
-        """Called when the agent is ready."""
-        self.agent = agent
-        self.ready = True
-        logging.info(f"[SATpwn] Plugin ready. Starting in {self.mode} mode.")
-    
-    def on_unfiltered_ap_list(self, agent, data):
-        """Process WiFi AP scan results and update memory."""
-        if not self.ready:
-            return
-        
-        now = time.time()
-        new_ap_count = 0
-        
-        # Check if we should update our activity check
-        if now - self._last_activity_check > 30:  # Update every 30 seconds
-            self._last_activity_check = now
-            
-        try:
-            aps = data.get('wifi', {}).get('aps', [])
-            for ap_data in aps:
-                ap_mac = ap_data.get('mac', '').lower()
-                if not ap_mac:
-                    continue
-                
-                ssid = ap_data.get('hostname', '')
-                rssi = ap_data.get('rssi', 0)
-                channel = ap_data.get('channel', 0)
-                encryption = ap_data.get('encryption', '')
-                
-                # Check if this is a new AP
-                is_new_ap = ap_mac not in self.memory
-                if is_new_ap:
-                    new_ap_count += 1
-                    logging.debug(f"[SATpwn] New AP discovered: {ssid} ({ap_mac})")
-                
-                # Update or create AP entry
-                if ap_mac not in self.memory:
-                    self.memory[ap_mac] = {
-                        "ssid": ssid,
-                        "first_seen": now,
-                        "last_seen": now,
-                        "rssi": rssi,
-                        "channel": channel,
-                        "encryption": encryption,
-                        "clients": {},
-                        "attack_history": [],
-                        "handshakes": 0,
-                        "pmkid_attempts": 0,
-                        "score": 0
-                    }
-                    self.memory_is_dirty = True
-                else:
-                    # Update existing AP
-                    ap_entry = self.memory[ap_mac]
-                    ap_entry["last_seen"] = now
-                    ap_entry["rssi"] = rssi
-                    if ssid:  # Only update SSID if we have one
-                        ap_entry["ssid"] = ssid
-                
-                # Process clients for this AP
-                clients = ap_data.get('clients', [])
-                for client_data in clients:
-                    client_mac = client_data.get('mac', '').lower()
-                    if not client_mac:
-                        continue
-                    
-                    if client_mac not in self.memory[ap_mac]["clients"]:
-                        self.memory[ap_mac]["clients"][client_mac] = {
-                            "first_seen": now,
-                            "last_seen": now,
-                            "packets": 0
-                        }
-                        self.memory_is_dirty = True
-                        logging.debug(f"[SATpwn] New client discovered: {client_mac} -> {ap_mac}")
-                    else:
-                        self.memory[ap_mac]["clients"][client_mac]["last_seen"] = now
-            
-            # Update activity history
-            self._update_activity_history(new_ap_count)
-            
-            # Handle AUTO mode logic
-            if self.mode == 'auto':
-                new_submode = self._auto_mode_logic()
-                if new_submode != self._current_auto_submode:
-                    logging.info(f"[SATpwn] AUTO mode switching: {self._current_auto_submode} -> {new_submode}")
-                    self._current_auto_submode = new_submode
-            
-        except Exception as e:
-            logging.error(f"[SATpwn] Error processing AP list: {e}")
-    
-    def on_ui_update(self, ui):
-        """Update the UI with current mode and stats."""
-        if not self.ready:
-            return
-        
-        try:
-            # Display current mode and stats
-            mode_display = self.mode
-            if self.mode == 'auto' and self._current_auto_submode:
-                mode_display = f"auto({self._current_auto_submode})"
-            
-            ap_count = len(self.memory)
-            total_clients = sum(len(ap.get("clients", {})) for ap in self.memory.values())
-            
-            # Show activity indicator
-            activity_indicator = ""
-            if self._is_moving():
-                activity_indicator = "📱"  # Moving
-            elif self._is_stationary():
-                activity_indicator = "🏠"  # Stationary
-            elif self._home_ssid_visible():
-                activity_indicator = "🏡"  # Home
-            
-            status_text = f"SATpwn:{mode_display} APs:{ap_count} Clients:{total_clients} {activity_indicator}"
-            
-            ui.set('SATpwn', status_text)
-            
-        except Exception as e:
-            logging.error(f"[SATpwn] Error updating UI: {e}")
-    
-    def on_epoch(self, agent, epoch, epoch_data):
-        """Called at the end of each epoch."""
-        if not self.ready:
-            return
-        
-        # Cleanup old entries periodically
-        if epoch % 10 == 0:  # Every 10 epochs
-            self._cleanup_memory()
-        
-        # Save memory if dirty
-        if self.memory_is_dirty and epoch % 5 == 0:  # Every 5 epochs
-            self._save_memory()
-            self.memory_is_dirty = False
+        logging.info("[SATpwn] plugin loaded")
+        self._load_memory()  # This now also restores the saved mode
     
     def on_unload(self, ui):
-        """Called when the plugin is being unloaded."""
-        logging.info("[SATpwn] Plugin unloading...")
-        if self.memory_is_dirty:
+        self._save_memory()  # This now also saves the current mode
+        self.executor.shutdown(wait=False)
+        logging.info("[SATpwn] plugin unloaded")
+    
+    def on_ready(self, agent):
+        self.agent = agent
+        self.ready = True
+        logging.info(f"[SATpwn] plugin ready in mode: {self.mode}")
+    
+    def on_ui_setup(self, ui):
+        ui.add_element('sat_mode', components.Text(
+        color=view.WHITE,
+        value=f'SAT Mode: {self.mode.capitalize()}',
+        position=(5,13)))
+    
+    def on_ui_update(self, ui):
+        mode_text = self.mode.capitalize()
+        if self.mode == 'auto' and self._current_auto_submode:
+            mode_text += f" ({self._current_auto_submode})"
+        ui.set('sat_mode', f'SAT Mode: {mode_text}')
+    
+    def on_wifi_update(self, agent, access_points):
+        now = time.time()
+        new_ap_count = 0
+        logging.debug(f"[SATpwn] WiFi update with {len(access_points)} APs")
+        
+        for ap in access_points:
+            ap_mac = ap['mac'].lower()
+            if ap_mac not in self.memory:
+                new_ap_count += 1
+                self.memory[ap_mac] = {
+                    "ssid": ap['hostname'], 
+                    "channel": ap['channel'], 
+                    "clients": {}, 
+                    "last_seen": now, 
+                    "handshakes": 0
+                }
+            else:
+                self.memory[ap_mac].update(
+                    last_seen=now, 
+                    ssid=ap['hostname'], 
+                    channel=ap['channel']
+                )
+            
+            for client in ap['clients']:
+                client_mac = client['mac'].lower()
+                
+                if client_mac not in self.memory[ap_mac]['clients']:
+                    self.memory[ap_mac]['clients'][client_mac] = {
+                        "last_seen": now, 
+                        "signal": client['rssi'], 
+                        "score": 0, 
+                        "last_attempt": 0, 
+                        "last_success": 0,
+                        "last_recalculated": 0
+                    }
+                else:
+                    self.memory[ap_mac]['clients'][client_mac].update(
+                        last_seen=now, 
+                        signal=client['rssi']
+                    )
+                
+                client_data = self.memory[ap_mac]['clients'][client_mac]
+                
+                # Throttle score recalculation
+                last_recalculated = client_data.get('last_recalculated', 0)
+                if now - last_recalculated > self.SCORE_RECALCULATION_INTERVAL_SECONDS:
+                    score = self._recalculate_client_score(ap_mac, client_mac)
+                    client_data['last_recalculated'] = now
+                else:
+                    score = client_data.get('score', 0)
+                
+                last_attempt = client_data.get('last_attempt', 0)
+                attack_score_threshold = self.DRIVE_BY_ATTACK_SCORE_THRESHOLD if self.mode == 'drive-by' else self.ATTACK_SCORE_THRESHOLD
+                attack_cooldown = self.DRIVE_BY_ATTACK_COOLDOWN_SECONDS if self.mode == 'drive-by' else self.ATTACK_COOLDOWN_SECONDS
+                
+                if score >= attack_score_threshold and (now - last_attempt > attack_cooldown):
+                    client_data['last_attempt'] = now
+                    self.executor.submit(self._execute_attack, agent, ap_mac, client_mac)
+        
+        # Update activity history for AUTO mode
+        self._update_activity_history(new_ap_count)
+        self.memory_is_dirty = True
+    
+    def on_handshake(self, agent, filename, ap, client):
+        ap_mac = ap['mac'].lower()
+        if ap_mac in self.memory:
+            self.memory[ap_mac]['handshakes'] = self.memory[ap_mac].get('handshakes', 0) + 1
+        
+        client_mac = client['mac'].lower()
+        if ap_mac in self.memory and client_mac in self.memory[ap_mac]['clients']:
+            self.memory[ap_mac]['clients'][client_mac]['last_success'] = time.time()
+            self._recalculate_client_score(ap_mac, client_mac)
+        
+        self.memory_is_dirty = True
+    
+    # Code for all of the modes (START)
+    def _epoch_strict(self, agent, epoch, epoch_data, supported_channels):
+        if self.memory_is_dirty or not self.channel_stats:
+            self.channel_stats = self._get_channel_stats()
+            self.memory_is_dirty = False
+        
+        # Weighted selection logic
+        channels = list(self.channel_stats.keys())
+        if not channels:
+            next_channel = random.choice(supported_channels)
+            logging.info(f"[SATpwn] No channel data, hopping to random channel {next_channel}")
+            agent.set_channel(next_channel)
+            return
+        
+        weights = []
+        for ch in channels:
+            stats = self.channel_stats.get(ch, {'clients': 0, 'handshakes': 0, 'aps': 0})
+            weight = (stats['clients'] * self.CLIENT_WEIGHT) + (stats['handshakes'] * self.HANDSHAKE_WEIGHT)
+            if stats['aps'] > self.PMKID_FRIENDLY_APS_THRESHOLD and stats['aps'] > stats['clients']:
+                weight *= self.PMKID_FRIENDLY_BOOST_FACTOR
+            weights.append(weight)
+        
+        # Filter down to only channels that are supported by the hardware
+        supported_channels_with_weights = []
+        supported_weights = []
+        for i, ch in enumerate(channels):
+            if ch in supported_channels:
+                supported_channels_with_weights.append(ch)
+                supported_weights.append(weights[i])
+        
+        if not supported_channels_with_weights:
+            next_channel = random.choice(supported_channels)
+            logging.info(f"[SATpwn] No tracked channels are supported, hopping to random supported channel {next_channel}")
+        else:
+            total_weight = sum(supported_weights)
+            if total_weight == 0:
+                next_channel = random.choice(supported_channels_with_weights)
+                logging.info(f"[SATpwn] All tracked channel weights are zero, hopping to random tracked/supported channel {next_channel}")
+            else:
+                next_channel = random.choices(supported_channels_with_weights, weights=supported_weights, k=1)[0]
+                logging.info(f"[SATpwn] Hopping to weighted-random channel {next_channel} (Mode: {self.mode})")
+        
+        agent.set_channel(next_channel)
+    
+    def _epoch_loose(self, agent, epoch, epoch_data, supported_channels):
+        if self.memory_is_dirty or not self.channel_stats:
+            self.channel_stats = self._get_channel_stats()
+            self.memory_is_dirty = False
+        
+        if random.random() < self.EXPLORATION_PROBABILITY:
+            next_channel = random.choice(supported_channels)
+            logging.info(f"[SATpwn] Exploring random channel {next_channel} (Mode: loose)")
+            agent.set_channel(next_channel)
+            return
+        
+        # Weighted selection logic
+        channels = list(self.channel_stats.keys())
+        if not channels:
+            next_channel = random.choice(supported_channels)
+            logging.info(f"[SATpwn] No channel data, hopping to random channel {next_channel}")
+            agent.set_channel(next_channel)
+            return
+        
+        weights = []
+        for ch in channels:
+            stats = self.channel_stats.get(ch, {'clients': 0, 'handshakes': 0, 'aps': 0})
+            weight = (stats['clients'] * self.CLIENT_WEIGHT) + (stats['handshakes'] * self.HANDSHAKE_WEIGHT)
+            if stats['aps'] > self.PMKID_FRIENDLY_APS_THRESHOLD and stats['aps'] > stats['clients']:
+                weight *= self.PMKID_FRIENDLY_BOOST_FACTOR
+            weights.append(weight)
+        
+        exploration_bonus = 1.0
+        weights = [w + exploration_bonus for w in weights]
+        logging.debug("[SATpwn] Applied exploration bonus for loose mode.")
+        
+        # Filter down to only channels that are supported by the hardware
+        supported_channels_with_weights = []
+        supported_weights = []
+        for i, ch in enumerate(channels):
+            if ch in supported_channels:
+                supported_channels_with_weights.append(ch)
+                supported_weights.append(weights[i])
+        
+        if not supported_channels_with_weights:
+            next_channel = random.choice(supported_channels)
+            logging.info(f"[SATpwn] No tracked channels are supported, hopping to random supported channel {next_channel}")
+        else:
+            total_weight = sum(supported_weights)
+            if total_weight == 0:
+                next_channel = random.choice(supported_channels_with_weights)
+                logging.info(f"[SATpwn] All tracked channel weights are zero, hopping to random tracked/supported channel {next_channel}")
+            else:
+                next_channel = random.choices(supported_channels_with_weights, weights=supported_weights, k=1)[0]
+                logging.info(f"[SATpwn] Hopping to weighted-random channel {next_channel} (Mode: {self.mode})")
+        
+        agent.set_channel(next_channel)
+    
+    def _epoch_driveby(self, agent, epoch, epoch_data, supported_channels):
+        # Drive-by mode uses strict logic but with different timing constants
+        self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+    
+    def _epoch_recon(self, agent, epoch, epoch_data, supported_channels):
+        # Initialize channel iterator if not already done
+        if self.recon_channel_iterator is None:
+            self.recon_channel_iterator = self._channel_iterator(supported_channels)
+            self.recon_channels_tested = []
+        
+        # If we've tested all channels, switch to strict mode for final optimization
+        if len(self.recon_channels_tested) >= len(supported_channels):
+            logging.info("[SATpwn] RECON: Completed channel survey, switching to strict mode logic")
+            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+            return
+        
+        try:
+            next_channel = next(self.recon_channel_iterator)
+            if next_channel not in self.recon_channels_tested:
+                self.recon_channels_tested.append(next_channel)
+                logging.info(f"[SATpwn] RECON: Inspecting channel {next_channel} and gathering info...")
+                agent.set_channel(next_channel)
+            else:
+                # Skip already tested channels
+                self._epoch_recon(agent, epoch, epoch_data, supported_channels)
+        except StopIteration:
+            # This shouldn't happen with our infinite iterator, but just in case
+            logging.info("[SATpwn] RECON: Channel iterator exhausted, switching to strict mode")
+            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+    
+    # Code for all of the modes (END)
+    
+    def on_epoch(self, agent, epoch, epoch_data):
+        self._cleanup_memory()
+        if not self.ready:
+            return Response("Plugin not ready yet.", mimetype='text/html')
+        
+        # Save memory and current mode every epoch
+        self._save_memory()
+        
+        supported_channels = agent.supported_channels()
+        logging.debug(f"[SATpwn] Supported channels: {supported_channels}")
+        
+        if not supported_channels:
+            logging.warning("[SATpwn] No supported channels found.")
+            return
+        
+        if self.mode == 'auto':
+            sub_mode = self._auto_mode_logic()
+            self._current_auto_submode = sub_mode
+            if sub_mode == 'recon':
+                logging.info("[SATpwn] AUTO ➜ RECON mode (home/stationary)")
+                self._epoch_recon(agent, epoch, epoch_data, supported_channels)
+            elif sub_mode == 'drive-by':
+                logging.info("[SATpwn] AUTO ➜ DRIVE-BY mode (moving)")
+                self._epoch_driveby(agent, epoch, epoch_data, supported_channels)
+            elif sub_mode == 'loose':
+                logging.info("[SATpwn] AUTO ➜ LOOSE mode (away & low data)")
+                self._epoch_loose(agent, epoch, epoch_data, supported_channels)
+            else:
+                logging.info("[SATpwn] AUTO ➜ STRICT mode (away & data-rich)")
+                self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+        elif self.mode == 'loose':
+            logging.info("[SATpwn] Epoch done; loading loose mode")
+            self._epoch_loose(agent, epoch, epoch_data, supported_channels)
+        elif self.mode == 'drive-by':
+            logging.info("[SATpwn] Epoch done; loading drive-by mode")
+            self._epoch_driveby(agent, epoch, epoch_data, supported_channels)
+        elif self.mode == 'recon':
+            logging.info("[SATpwn] Epoch done; loading recon mode")
+            self._epoch_recon(agent, epoch, epoch_data, supported_channels)
+        else:
+            logging.info("[SATpwn] Epoch done; loading strict mode")
+            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+    
+    def on_webhook(self, path, request):
+        # Handle mode toggling
+        if path == 'toggle_mode':
+            current_index = self.modes.index(self.mode)
+            logging.debug(f"current index = {current_index}")
+            next_index = (current_index + 1) % len(self.modes)
+            logging.debug(f"next index = {next_index}")
+            
+            old_mode = self.mode
+            self.mode = self.modes[next_index]
+            
+            # Reset recon state when switching modes
+            if self.mode == 'recon':
+                self.recon_channel_iterator = None
+                self.recon_channels_tested = []
+            
+            # Reset AUTO sub-mode tracking
+            if self.mode == 'auto':
+                self._current_auto_submode = None
+            
+            # Save the new mode immediately
             self._save_memory()
-        if hasattr(self, 'executor'):
-            self.executor.shutdown(wait=True)
-        logging.info("[SATpwn] Plugin unloaded successfully")
+            
+            logging.info(f"[SATpwn] Mode changed from {old_mode} to {self.mode}")
+            return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
+        
+        # Main dashboard page
+        if path == '/' or not path:
+            if self.memory_is_dirty or not self.channel_stats:
+                self.channel_stats = self._get_channel_stats()
+                self.memory_is_dirty = False
+            
+            total_aps = len(self.memory)
+            total_clients = sum(len(ap.get('clients', {})) for ap in self.memory.values())
+            
+            channel_html = "<table><tr><th>Ch</th><th>APs</th><th>Clients</th><th>Handshakes</th></tr>"
+            for ch, stats in sorted(self.channel_stats.items()):
+                channel_html += f"<tr><td>{ch}</td><td>{stats['aps']}</td><td>{stats['clients']}</td><td>{stats['handshakes']}</td></tr>"
+            channel_html += "</table>"
+            
+            memory_html = "<table><tr><th>AP (SSID/MAC)</th><th>Ch</th><th>Last Seen</th><th>Clients (MAC / Score / Last Seen)</th></tr>"
+            sorted_aps = sorted(self.memory.items(), key=lambda item: item[1].get('last_seen', 0), reverse=True)
+            for ap_mac, ap_data in sorted_aps:
+                last_seen_ap = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ap_data.get('last_seen', 0)))
+                client_html = "<ul style='margin:0;padding-left:15px;'>"
+                sorted_clients = sorted(ap_data.get('clients', {}).items(), key=lambda item: item[1].get('score', 0), reverse=True)
+                for client_mac, client_data in sorted_clients:
+                    last_seen_client = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(client_data.get('last_seen', 0)))
+                    score = client_data.get('score', 0)
+                    client_html += f"<li><small>{client_mac} | Score: {score:.2f} | Seen: {last_seen_client}</small></li>"
+                client_html += "</ul>"
+                memory_html += f"<tr><td>{ap_data.get('ssid', 'N/A')}<br><small>{ap_mac}</small></td><td>{ap_data.get('channel', 'N/A')}</td><td>{last_seen_ap}</td><td>{client_html}</td></tr>"
+            memory_html += "</table>"
+            
+            next_mode_index = (self.modes.index(self.mode) + 1) % len(self.modes)
+            next_mode_name = self.modes[next_mode_index].replace('-', ' ').title()
+            mode_toggle_button = f"<a href='/plugins/SATpwn/toggle_mode' style='display:inline-block;padding:10px;background-color:#569cd6;color:#fff;text-decoration:none;border-radius:5px;'>Switch to {next_mode_name} Mode</a>"
+            
+            # Add recon status if in recon mode
+            recon_status = ""
+            if self.mode == 'recon':
+                channels_tested = len(self.recon_channels_tested) if self.recon_channels_tested else 0
+                total_channels = len(self.agent.supported_channels()) if self.agent else 0
+                recon_status = f"<p><b>Recon Progress:</b> {channels_tested}/{total_channels} channels surveyed</p>"
+            
+            # Add AUTO mode status (without GPS info)
+            auto_status = ""
+            if self.mode == 'auto':
+                home_visible = self._home_ssid_visible()
+                is_stationary = self._is_stationary()
+                is_moving = self._is_moving()
+                current_sub = self._current_auto_submode or "determining..."
+                
+                recent_activity = sum(count for t, count in self._activity_history 
+                                    if time.time() - t <= self.ACTIVITY_WINDOW_SECONDS)
+                
+                auto_status = f"""
+                <p><b>AUTO Sub-Mode:</b> {current_sub.upper()}</p>
+                <p><b>Home SSID Visible:</b> {'Yes' if home_visible else 'No'}</p>
+                <p><b>Stationary (1hr):</b> {'Yes' if is_stationary else 'No'}</p>
+                <p><b>Moving:</b> {'Yes' if is_moving else 'No'}</p>
+                <p><b>Recent Activity:</b> {recent_activity} new APs (5min)</p>
+                <p><b>Home Whitelist:</b> {len(self.home_whitelist)} entries</p>
+                """
+            
+            html = f"""
+            <html>
+            <head>
+                <title>Smart Auto-Tune Dashboard</title>
+                <style>
+                    body {{ font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; margin: 0; padding: 20px; }}
+                    .container {{ display: grid; grid-template-columns: 1fr; gap: 20px; }}
+                    .grid-2-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+                    .card {{ background-color: #252526; border: 1px solid #333; border-radius: 5px; padding: 15px; }}
+                    h1, h2 {{ color: #569cd6; border-bottom: 1px solid #333; padding-bottom: 5px;}}
+                    table {{ width: 100%; border-collapse: collapse; }}
+                    th, td {{ border: 1px solid #444; padding: 8px; text-align: left; vertical-align: top;}}
+                    th {{ background-color: #333; }}
+                    ul {{ list-style-type: none; margin: 0; padding-left: 15px;}}
+                </style>
+            </head>
+            <body>
+                <h1>SATpwn Dashboard</h1>
+                <div class="container">
+                    <div class="grid-2-col">
+                        <div class="card">
+                            <h2>Live Stats</h2>
+                            <p>Total APs Tracked: {total_aps}</p>
+                            <p>Total Clients Tracked: {total_clients}</p>
+                        </div>
+                        <div class="card">
+                            <h2>Controls</h2>
+                            <p><b>Current Mode:</b> {self.mode.upper()}</p>
+                            {recon_status}
+                            {auto_status}
+                            {mode_toggle_button}
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h2>Channel Weights</h2>
+                        {channel_html}
+                    </div>
+                    <div class="card">
+                        <h2>AP & Client Memory</h2>
+                        {memory_html}
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            return Response(html, mimetype='text/html')
+        
+        return Response("Not Found", status=404, mimetype='text/html')
