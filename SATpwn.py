@@ -20,7 +20,7 @@ except ImportError:
 
 class SATpwn(plugins.Plugin):
     __author__ = 'Renmeii x Mr-Cass-Ette and discoJack too '
-    __version__ = 'x88.0.7-no-gps'
+    __version__ = 'x88.0.7'
     __license__ = 'GPL3'
     __description__ = 'SATpwn intelligent targeting without GPS dependencies'
     
